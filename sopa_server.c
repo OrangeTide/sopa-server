@@ -30,6 +30,8 @@
 
 /* port serve */
 #define HTTP_PORT 80
+/* uid for a safe http user */
+#define HTTP_USER 33
 /* timeout in seconds for idle connections */
 #define HTTP_TIMEOUT 5
 /* maximum size of a header, this is pretty important. */
@@ -59,6 +61,8 @@ static char hdr[HTTP_HDRMAX];
 static size_t hdr_len;
 static char *msg;
 static size_t msg_len;
+static const char *progname;
+static const char *default_content_type = "text/html; charset=UTF-8";
 
 static void log_info(const char *fmt, ...)
 {
@@ -130,7 +134,7 @@ static void client_accept(int listen_fd)
 	newfd = accept(listen_fd, (struct sockaddr*)&sin, &len);
 	if (newfd < 0) {
 		if (errno != EAGAIN)
-			perror_and_die("accept");
+			perror_and_die("accept()");
 		return;
 	}
 	log_info("new client fd %d\n", newfd);
@@ -149,7 +153,7 @@ static int client_write(struct client *cl,
 	struct client **prev __attribute__((unused)))
 {
 	const char *buf;
-	ssize_t buflen;
+	size_t buflen;
 	ssize_t res;
 
 	switch (cl->state) {
@@ -308,24 +312,22 @@ static void process_writers(void)
 	process_generic(&writer_head, &wfds, client_write);
 }
 
-static void encode_hdr(void)
+static void encode_hdr(time_t mtime, const char *content_type)
 {
 	char timebuf[128];
-	time_t t;
 	struct tm *tm;
 
-	time(&t);
-	tm = gmtime(&t);
+	tm = gmtime(&mtime);
 	strftime(timebuf, sizeof(timebuf), "%a, %d %b %Y %T %z", tm);
 
 	hdr_len = snprintf(hdr, sizeof(hdr),
 		"HTTP/1.1 200 OK\r\n"
-		"Content-Type: text/html; charset=UTF-8\r\n"
+		"Content-Type: %s\r\n"
 		"Date: %s\r\n"
 		"Content-Length: %zu\r\n"
-		"\r\n", timebuf, msg_len);
+		"\r\n", content_type, timebuf, msg_len);
 	if (hdr_len >= sizeof(hdr))
-		perror_and_die("snprint");
+		perror_and_die("snprintf()");
 }
 
 static void load_file(const char *filename)
@@ -356,37 +358,119 @@ static void load_file(const char *filename)
 		}
 	} while ((size_t)len != msg_len);
 	close(fd);
-	encode_hdr();
+	encode_hdr(st.st_mtime, default_content_type);
 }
 
-int main()
+static void drop_root(void)
+{
+	if (getuid() == 0)
+		if (setuid(HTTP_USER))
+			perror_and_die("setuid()");
+}
+
+static void daemonize(void)
+{
+	pid_t pid;
+	pid_t sid;
+
+	/* check if we're already a daemon */
+	if (getppid() == 1)
+		return;
+
+	if (chdir("/") < 0)
+		perror_and_die("chdir()");
+	pid = fork();
+	if (pid == (pid_t)-1)
+		perror_and_die("fork()");
+	if (pid)
+		exit(EXIT_SUCCESS); /* exit parent */
+	sid = setsid();
+	if (sid == (pid_t)-1)
+		perror_and_die("setsid()");
+	close(STDIN_FILENO);
+	close(STDOUT_FILENO);
+	close(STDERR_FILENO);
+	open("/dev/null", O_RDONLY);
+	open("/dev/null", O_WRONLY);
+	open("/dev/null", O_WRONLY);
+}
+
+void usage(void)
+{
+	fprintf(stderr, "usage: %s [-hd] [-f <filename>] [-p <port>] [-t <type>\n",
+		progname);
+	fprintf(stderr, "  -h    help\n");
+	fprintf(stderr, "  -d    don't daemonize\n");
+	fprintf(stderr, "  -f f  file to serve\n");
+	fprintf(stderr, "  -p n  port to serve\n");
+	fprintf(stderr, "  -t t  content type [%s]\n", default_content_type);
+	exit(EXIT_FAILURE);
+}
+
+int main(int argc, char **argv)
 {
 	int listen_fd;
 	struct sockaddr_in sin;
 	int e;
 	int op = 1;
+	int c;
+	int daemonize_fl = 1;
+	const char *filename = "sopa.html";
+	unsigned short port = HTTP_PORT;
 
-	load_file("sopa.html");
+	progname = strrchr(argv[0], '/');
+	if (progname)
+		progname++;
+	else
+		progname = argv[0];
+
+	while ((c=getopt(argc, argv, "hdf:p:t:"))>0) {
+		switch(c) {
+		default:
+		case 'h':
+			usage();
+		case 'd':
+			daemonize_fl = 0;
+			break;
+		case 'f':
+			filename = optarg;
+			break;
+		case 'p':
+			port = atoi(optarg);
+			break;
+		case 't':
+			default_content_type = optarg;
+			break;
+		}
+	}
+
+	umask(0);
 	listen_fd = socket(AF_INET, SOCK_STREAM, 0);
 	if (listen_fd < 0)
-		perror_and_die("socket");
+		perror_and_die("socket()");
 	e = setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &op, sizeof(op));
 	if (e)
 		perror_and_die("SO_REUSEADDR");
 	memset(&sin, 0, sizeof(sin));
 	sin.sin_family = AF_INET;
-	sin.sin_port = htons(HTTP_PORT);
+	sin.sin_port = htons(port);
 	e = bind(listen_fd, (struct sockaddr*)&sin, sizeof(sin));
 	if (e)
-		perror_and_die("bind");
+		perror_and_die("bind()");
 	e = fcntl(listen_fd, F_SETFL, O_NONBLOCK);
 	if (e)
-		perror_and_die("fctnl");
+		perror_and_die("fcntl()");
 	e = listen(listen_fd, SOMAXCONN);
 	if (e)
-		perror_and_die("listen");
+		perror_and_die("listen()");
 	fd_max = listen_fd;
 	youngest = INT_MAX;
+
+	drop_root();
+	load_file(filename);
+
+	if (daemonize_fl)
+		daemonize();
 
 	memset(&rfds, 0, sizeof(rfds));
 	memset(&wfds, 0, sizeof(wfds));
@@ -415,7 +499,7 @@ int main()
 #endif
 		e = select(fd_max + 1, &rfds, &wfds, NULL, tv);
 		if (e < 0)
-			perror_and_die("");
+			perror_and_die("select()");
 		if (FD_ISSET(listen_fd, &rfds)) {
 			client_accept(listen_fd);
 			e--;
